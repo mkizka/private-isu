@@ -1,15 +1,52 @@
-"use strict";
-const bodyParser = require("body-parser");
-const multer = require("multer");
-const express = require("express");
-const session = require("express-session");
-const flash = require("express-flash");
-const ejs = require("ejs");
-const mysql = require("mysql2/promise");
-const Promise = require("bluebird");
-const exec = require("child_process").exec;
-const crypto = require("crypto");
-const memcacheStore = require("connect-memcached")(session);
+import bodyParser from "body-parser";
+import multer from "multer";
+import express from "express";
+import session from "express-session";
+import flash from "express-flash";
+import ejs from "ejs";
+import mysql from "mysql2/promise";
+import { exec } from "child_process";
+import crypto from "crypto";
+import connectMemcached from "connect-memcached";
+const memcacheStore = connectMemcached(session);
+
+declare module "express-session" {
+  interface SessionData {
+    userId: number;
+    csrfToken: string;
+  }
+}
+
+interface User {
+  id: number;
+  account_name: string;
+  passhash: string;
+  authority: 1 | 0;
+  del_flg: 1 | 0;
+  created_at: Date;
+}
+
+interface Post {
+  id: number;
+  user_id: number;
+  mime: string;
+  imgdata: Buffer;
+  body: string;
+  created_at: Date;
+  comment_count?: number;
+  comments?: Comment[];
+  user?: User;
+  csrfToken?: string;
+}
+
+interface Comment {
+  id: number;
+  post_id: number;
+  user_id: number;
+  comment: string;
+  created_at: Date;
+  user?: User;
+}
 
 const app = express();
 const upload = multer({});
@@ -19,7 +56,7 @@ const UPLOAD_LIMIT = 10 * 1024 * 1024; // 10mb
 
 const _db = mysql.createPool({
   host: process.env.ISUCONP_DB_HOST || "localhost",
-  port: process.env.ISUCONP_DB_PORT || 3306,
+  port: parseInt(process.env.ISUCONP_DB_PORT || "3306"),
   user: process.env.ISUCONP_DB_USER || "root",
   password: process.env.ISUCONP_DB_PASSWORD,
   database: process.env.ISUCONP_DB_NAME || "isuconp",
@@ -28,9 +65,9 @@ const _db = mysql.createPool({
 });
 
 const db = {
-  query: async (q, a) => {
-    const [rows] = await _db.query(q, a);
-    return rows;
+  query: async <T>(sql: string, values?: any) => {
+    const [rows] = await _db.query(sql, values);
+    return rows as T[];
   },
 };
 
@@ -51,16 +88,19 @@ app.use(
 
 app.use(flash());
 
-function getSessionUser(req) {
-  return new Promise((done, reject) => {
+function getSessionUser(req: express.Request) {
+  return new Promise<User | undefined>((done, reject) => {
     if (!req.session.userId) {
+      // @ts-ignore
       done();
       return;
     }
-    db.query("SELECT * FROM `users` WHERE `id` = ?", [req.session.userId])
+    db.query<User>("SELECT * FROM `users` WHERE `id` = ?", [req.session.userId])
       .then((users) => {
         let user = users[0];
         if (user) {
+          // TODO: 他言語にない処理なので消せるかも
+          // @ts-ignore
           user.csrfToken = req.session.csrfToken;
         }
         done(user);
@@ -69,8 +109,8 @@ function getSessionUser(req) {
   });
 }
 
-function digest(src) {
-  return new Promise((resolve, reject) => {
+function digest(src: string) {
+  return new Promise<string>((resolve, reject) => {
     // TODO: shellescape対策
     exec(
       'printf "%s" ' + src + " | openssl dgst -sha512 | sed 's/^.*= //'",
@@ -85,7 +125,7 @@ function digest(src) {
   });
 }
 
-function validateUser(accountName, password) {
+function validateUser(accountName: string, password: string) {
   if (
     !(
       /^[0-9a-zA-Z_]{3,}$/.test(accountName) &&
@@ -98,8 +138,8 @@ function validateUser(accountName, password) {
   }
 }
 
-function calculatePasshash(accountName, password) {
-  return new Promise((resolve, reject) => {
+function calculatePasshash(accountName: string, password: string) {
+  return new Promise<string>((resolve, reject) => {
     digest(accountName)
       .then((salt) => {
         digest(`${password}:${salt}`).then(resolve, reject);
@@ -108,9 +148,9 @@ function calculatePasshash(accountName, password) {
   });
 }
 
-function tryLogin(accountName, password) {
-  return new Promise((resolve, reject) => {
-    db.query(
+function tryLogin(accountName: string, password: string) {
+  return new Promise<User | void>((resolve, reject) => {
+    db.query<User>(
       "SELECT * FROM users WHERE account_name = ? AND del_flg = 0",
       accountName
     )
@@ -132,9 +172,9 @@ function tryLogin(accountName, password) {
   });
 }
 
-function getUser(userId) {
-  return new Promise((resolve, reject) => {
-    db.query("SELECT * FROM `users` WHERE `id` = ?", [userId])
+function getUser(userId: number) {
+  return new Promise<User>((resolve, reject) => {
+    db.query<User>("SELECT * FROM `users` WHERE `id` = ?", [userId])
       .then((users) => {
         resolve(users[0]);
       })
@@ -143,8 +183,8 @@ function getUser(userId) {
 }
 
 function dbInitialize() {
-  return new Promise((resolve, reject) => {
-    let sqls = [];
+  return new Promise<void>((resolve, reject) => {
+    let sqls: string[] = [];
     sqls.push("DELETE FROM users WHERE id > 1000");
     sqls.push("DELETE FROM posts WHERE id > 10000");
     sqls.push("DELETE FROM comments WHERE id > 100000");
@@ -160,7 +200,7 @@ function dbInitialize() {
   });
 }
 
-function imageUrl(post) {
+function imageUrl(post: Post) {
   let ext = "";
 
   switch (post.mime) {
@@ -178,8 +218,8 @@ function imageUrl(post) {
   return `/image/${post.id}${ext}`;
 }
 
-function makeComment(comment) {
-  return new Promise((resolve, reject) => {
+function makeComment(comment: Comment) {
+  return new Promise<Comment>((resolve, reject) => {
     getUser(comment.user_id)
       .then((user) => {
         comment.user = user;
@@ -189,12 +229,15 @@ function makeComment(comment) {
   });
 }
 
-function makePost(post, options) {
-  return new Promise((resolve, reject) => {
-    db.query("SELECT COUNT(*) AS `count` FROM `comments` WHERE `post_id` = ?", [
-      post.id,
-    ])
+function makePost(post: Post, options: { allComments?: boolean }) {
+  return new Promise<Post>((resolve, reject) => {
+    db.query<{ count: number }>(
+      "SELECT COUNT(*) AS `count` FROM `comments` WHERE `post_id` = ?",
+      [post.id]
+    )
       .then((commentCount) => {
+        // TODO: `commentCount`は配列かも
+        // @ts-ignore
         post.comment_count = commentCount.count || 0;
         var query =
           "SELECT * FROM `comments` WHERE `post_id` = ? ORDER BY `created_at` DESC";
@@ -202,7 +245,7 @@ function makePost(post, options) {
           query += " LIMIT 3";
         }
         return db
-          .query(query, [post.id])
+          .query<Comment>(query, [post.id])
           .then((comments) => {
             return Promise.all(
               comments.map((comment) => {
@@ -225,27 +268,27 @@ function makePost(post, options) {
   });
 }
 
-function filterPosts(posts) {
+function filterPosts(posts: Post[]) {
   return posts
-    .filter((post) => post.user.del_flg === 0)
+    .filter((post) => post.user!.del_flg === 0)
     .slice(0, POSTS_PER_PAGE);
 }
 
-function makePosts(posts, options) {
+function makePosts(posts: Post[], options?: { allComments?: boolean }) {
   if (typeof options === "undefined") {
     options = {};
   }
   if (typeof options.allComments === "undefined") {
     options.allComments = false;
   }
-  return new Promise((resolve, reject) => {
+  return new Promise<Post[]>((resolve, reject) => {
     if (posts.length === 0) {
       resolve([]);
       return;
     }
     Promise.all(
       posts.map((post) => {
-        return makePost(post, options);
+        return makePost(post, options!);
       })
     ).then(resolve, reject);
   });
@@ -336,7 +379,7 @@ app.post("/register", (req, res) => {
           let query =
             "INSERT INTO `users` (`account_name`, `passhash`) VALUES (?, ?)";
           db.query(query, [accountName, passhash]).then(() => {
-            db.query(
+            db.query<User>(
               "SELECT * FROM `users` WHERE `account_name` = ?",
               accountName
             ).then((users) => {
@@ -353,6 +396,7 @@ app.post("/register", (req, res) => {
 });
 
 app.get("/logout", (req, res) => {
+  // @ts-ignore
   req.session.destroy();
   res.redirect("/");
 });
@@ -360,7 +404,7 @@ app.get("/logout", (req, res) => {
 app.get("/", (req, res) => {
   getSessionUser(req)
     .then((me) => {
-      db.query(
+      db.query<Post>(
         "SELECT `id`, `user_id`, `body`, `created_at`, `mime` FROM `posts` ORDER BY `created_at` DESC"
       )
         .then((posts) => {
@@ -380,8 +424,17 @@ app.get("/", (req, res) => {
     });
 });
 
+interface Context {
+  user: User;
+  posts: Post[];
+  commentCount?: number;
+  postCount?: number;
+  commentedCount?: number;
+  me?: User;
+}
+
 app.get("/@:accountName/", (req, res) => {
-  db.query(
+  db.query<User>(
     "SELECT * FROM `users` WHERE `account_name` = ? AND `del_flg` = 0",
     req.params.accountName
   )
@@ -395,7 +448,7 @@ app.get("/@:accountName/", (req, res) => {
     })
     .then((user) => {
       return db
-        .query(
+        .query<Post>(
           "SELECT `id`, `user_id`, `body`, `mime`, `created_at` FROM `posts` WHERE `user_id` = ? ORDER BY `created_at` DESC",
           user.id
         )
@@ -404,9 +457,9 @@ app.get("/@:accountName/", (req, res) => {
           return { user, posts };
         });
     })
-    .then((context) => {
+    .then((context: Context) => {
       return db
-        .query(
+        .query<{ count: number }>(
           "SELECT COUNT(*) AS count FROM `comments` WHERE `user_id` = ?",
           context.user.id
         )
@@ -415,9 +468,12 @@ app.get("/@:accountName/", (req, res) => {
           return context;
         });
     })
-    .then((context) => {
+    .then((context: Context) => {
       return db
-        .query("SELECT `id` FROM `posts` WHERE `user_id` = ?", context.user.id)
+        .query<Post>(
+          "SELECT `id` FROM `posts` WHERE `user_id` = ?",
+          context.user.id
+        )
         .then((postIdRows) => {
           return postIdRows.map((row) => row.id);
         })
@@ -428,7 +484,7 @@ app.get("/@:accountName/", (req, res) => {
             return context;
           } else {
             return db
-              .query(
+              .query<{ count: number }>(
                 "SELECT COUNT(*) AS count FROM `comments` WHERE `post_id` IN (?)",
                 [postIds]
               )
@@ -441,7 +497,7 @@ app.get("/@:accountName/", (req, res) => {
           }
         });
     })
-    .then((context) => {
+    .then((context: Context) => {
       return getSessionUser(req).then((me) => {
         context.me = me;
         return context;
@@ -467,11 +523,12 @@ app.get("/@:accountName/", (req, res) => {
 });
 
 app.get("/posts", (req, res) => {
+  // @ts-ignore
   let max_created_at = new Date(req.query.max_created_at);
   if (max_created_at.toString() === "Invalid Date") {
     max_created_at = new Date();
   }
-  db.query(
+  db.query<Post>(
     "SELECT `id`, `user_id`, `body`, `mime`, `created_at` FROM `posts` WHERE `created_at` <= ? ORDER BY `created_at` DESC",
     max_created_at
   ).then((posts) => {
@@ -484,20 +541,21 @@ app.get("/posts", (req, res) => {
 });
 
 app.get("/posts/:id", (req, res) => {
-  db.query("SELECT * FROM `posts` WHERE `id` = ?", req.params.id || "").then(
-    (posts) => {
-      makePosts(posts, { allComments: true }).then((posts) => {
-        let post = posts[0];
-        if (!post) {
-          res.status(404).send("not found");
-          return;
-        }
-        getSessionUser(req).then((me) => {
-          res.render("post.ejs", { imageUrl, post: post, me: me });
-        });
+  db.query<Post>(
+    "SELECT * FROM `posts` WHERE `id` = ?",
+    req.params.id || ""
+  ).then((posts) => {
+    makePosts(posts, { allComments: true }).then((posts) => {
+      let post = posts[0];
+      if (!post) {
+        res.status(404).send("not found");
+        return;
+      }
+      getSessionUser(req).then((me) => {
+        res.render("post.ejs", { imageUrl, post: post, me: me });
       });
-    }
-  );
+    });
+  });
 });
 
 app.post("/", upload.single("file"), (req, res) => {
@@ -541,6 +599,7 @@ app.post("/", upload.single("file"), (req, res) => {
       "INSERT INTO `posts` (`user_id`, `mime`, `imgdata`, `body`) VALUES (?,?,?,?)";
     db.query(query, [me.id, mime, req.file.buffer, req.body.body]).then(
       (result) => {
+        // @ts-ignore
         res.redirect(`/posts/${encodeURIComponent(result.insertId)}`);
         return;
       }
@@ -549,7 +608,7 @@ app.post("/", upload.single("file"), (req, res) => {
 });
 
 app.get("/image/:id.:ext", (req, res) => {
-  db.query("SELECT * FROM `posts` WHERE `id` = ?", req.params.id)
+  db.query<Post>("SELECT * FROM `posts` WHERE `id` = ?", req.params.id)
     .then((posts) => {
       let post = posts[0];
       if (!post) {
@@ -615,7 +674,13 @@ app.get("/admin/banned", (req, res) => {
   });
 });
 
-app.post("/admin/banned", (req, res) => {
+type BannedRequest = express.Request<
+  any,
+  any,
+  { uid: number[]; csrf_token: string }
+>;
+
+app.post("/admin/banned", (req: BannedRequest, res) => {
   getSessionUser(req).then((me) => {
     if (!me) {
       res.redirect("/");
