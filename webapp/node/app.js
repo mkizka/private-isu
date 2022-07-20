@@ -5,7 +5,7 @@ const express = require("express");
 const session = require("express-session");
 const flash = require("express-flash");
 const ejs = require("ejs");
-const mysql = require("promise-mysql");
+const mysql = require("mysql2/promise");
 const Promise = require("bluebird");
 const exec = require("child_process").exec;
 const crypto = require("crypto");
@@ -17,7 +17,7 @@ const upload = multer({});
 const POSTS_PER_PAGE = 20;
 const UPLOAD_LIMIT = 10 * 1024 * 1024; // 10mb
 
-const db = mysql.createPool({
+const _db = mysql.createPool({
   host: process.env.ISUCONP_DB_HOST || "localhost",
   port: process.env.ISUCONP_DB_PORT || 3306,
   user: process.env.ISUCONP_DB_USER || "root",
@@ -26,6 +26,13 @@ const db = mysql.createPool({
   connectionLimit: 1,
   charset: "utf8mb4",
 });
+
+const db = {
+  query: async (q, a) => {
+    const [rows] = await _db.query(q, a);
+    return rows;
+  },
+};
 
 app.engine("ejs", ejs.renderFile);
 app.use(bodyParser.urlencoded({ extended: true }));
@@ -37,7 +44,7 @@ app.use(
     saveUninitialized: true,
     secret: process.env.ISUCONP_SESSION_SECRET || "sendagaya",
     store: new memcacheStore({
-      hosts: ["127.0.0.1:11211"],
+      hosts: [process.env.ISUCONP_MEMCACHED_ADDRESS || "127.0.0.1:11211"],
     }),
   })
 );
