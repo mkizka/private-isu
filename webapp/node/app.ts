@@ -5,9 +5,11 @@ import session from "express-session";
 import flash from "express-flash";
 import ejs from "ejs";
 import mysql from "mysql2/promise";
-import { exec } from "child_process";
+import { promisify } from "util";
+import { exec as _exec } from "child_process";
 import crypto from "crypto";
 import connectMemcached from "connect-memcached";
+const exec = promisify(_exec);
 const memcacheStore = connectMemcached(session);
 
 declare module "express-session" {
@@ -88,41 +90,28 @@ app.use(
 
 app.use(flash());
 
-function getSessionUser(req: express.Request) {
-  return new Promise<User | undefined>((done, reject) => {
-    if (!req.session.userId) {
-      // @ts-ignore
-      done();
-      return;
-    }
-    db.query<User>("SELECT * FROM `users` WHERE `id` = ?", [req.session.userId])
-      .then((users) => {
-        let user = users[0];
-        if (user) {
-          // TODO: 他言語にない処理なので消せるかも
-          // @ts-ignore
-          user.csrfToken = req.session.csrfToken;
-        }
-        done(user);
-      })
-      .catch(reject);
-  });
+async function getSessionUser(req: express.Request) {
+  if (!req.session.userId) {
+    return;
+  }
+  const users = await db.query<User>("SELECT * FROM `users` WHERE `id` = ?", [
+    req.session.userId,
+  ]);
+  let user = users[0];
+  if (user) {
+    // TODO: 他言語にない処理なので消せるかも
+    // @ts-ignore
+    user.csrfToken = req.session.csrfToken;
+  }
+  return user;
 }
 
-function digest(src: string) {
-  return new Promise<string>((resolve, reject) => {
-    // TODO: shellescape対策
-    exec(
-      'printf "%s" ' + src + " | openssl dgst -sha512 | sed 's/^.*= //'",
-      (err, stdout, stderr) => {
-        if (err) {
-          reject(err);
-          return;
-        }
-        resolve(stdout.replace(/^\s*(.+)\s*$/, "$1"));
-      }
-    );
-  });
+async function digest(src: string) {
+  // TODO: shellescape対策
+  const { stdout } = await exec(
+    'printf "%s" ' + src + " | openssl dgst -sha512 | sed 's/^.*= //'"
+  );
+  return stdout.replace(/^\s*(.+)\s*$/, "$1");
 }
 
 function validateUser(accountName: string, password: string) {
@@ -138,66 +127,44 @@ function validateUser(accountName: string, password: string) {
   }
 }
 
-function calculatePasshash(accountName: string, password: string) {
-  return new Promise<string>((resolve, reject) => {
-    digest(accountName)
-      .then((salt) => {
-        digest(`${password}:${salt}`).then(resolve, reject);
-      })
-      .catch(reject);
-  });
+async function calculatePasshash(accountName: string, password: string) {
+  const salt = await digest(accountName);
+  return digest(`${password}:${salt}`);
 }
 
-function tryLogin(accountName: string, password: string) {
-  return new Promise<User | void>((resolve, reject) => {
-    db.query<User>(
-      "SELECT * FROM users WHERE account_name = ? AND del_flg = 0",
-      accountName
-    )
-      .then((users) => {
-        let user = users[0];
-        if (!user) {
-          resolve();
-          return;
-        }
-        calculatePasshash(accountName, password).then((passhash) => {
-          if (passhash === user.passhash) {
-            resolve(user);
-          } else {
-            resolve();
-          }
-        });
-      })
-      .catch(reject);
-  });
+async function tryLogin(accountName: string, password: string) {
+  const users = await db.query<User>(
+    "SELECT * FROM users WHERE account_name = ? AND del_flg = 0",
+    accountName
+  );
+  let user = users[0];
+  if (!user) {
+    return;
+  }
+  const passhash = await calculatePasshash(accountName, password);
+  if (passhash === user.passhash) {
+    return user;
+  } else {
+    return;
+  }
 }
 
-function getUser(userId: number) {
-  return new Promise<User>((resolve, reject) => {
-    db.query<User>("SELECT * FROM `users` WHERE `id` = ?", [userId])
-      .then((users) => {
-        resolve(users[0]);
-      })
-      .catch(reject);
-  });
+async function getUser(userId: number) {
+  const users = await db.query<User>("SELECT * FROM `users` WHERE `id` = ?", [
+    userId,
+  ]);
+  return users[0];
 }
 
-function dbInitialize() {
-  return new Promise<void>((resolve, reject) => {
-    let sqls: string[] = [];
-    sqls.push("DELETE FROM users WHERE id > 1000");
-    sqls.push("DELETE FROM posts WHERE id > 10000");
-    sqls.push("DELETE FROM comments WHERE id > 100000");
-    sqls.push("UPDATE users SET del_flg = 0");
+async function dbInitialize() {
+  let sqls: string[] = [];
+  sqls.push("DELETE FROM users WHERE id > 1000");
+  sqls.push("DELETE FROM posts WHERE id > 10000");
+  sqls.push("DELETE FROM comments WHERE id > 100000");
+  sqls.push("UPDATE users SET del_flg = 0");
 
-    Promise.all(sqls.map((sql) => db.query(sql))).then(() => {
-      db.query("UPDATE users SET del_flg = 1 WHERE id % 50 = 0")
-        .then(() => {
-          resolve();
-        })
-        .catch(reject);
-    });
-  });
+  await Promise.all(sqls.map((sql) => db.query(sql)));
+  await db.query("UPDATE users SET del_flg = 1 WHERE id % 50 = 0");
 }
 
 function imageUrl(post: Post) {
@@ -218,54 +185,35 @@ function imageUrl(post: Post) {
   return `/image/${post.id}${ext}`;
 }
 
-function makeComment(comment: Comment) {
-  return new Promise<Comment>((resolve, reject) => {
-    getUser(comment.user_id)
-      .then((user) => {
-        comment.user = user;
-        resolve(comment);
-      })
-      .catch(reject);
-  });
+async function makeComment(comment: Comment) {
+  const user = await getUser(comment.user_id);
+  comment.user = user;
+  return comment;
 }
 
-function makePost(post: Post, options: { allComments?: boolean }) {
-  return new Promise<Post>((resolve, reject) => {
-    db.query<{ count: number }>(
-      "SELECT COUNT(*) AS `count` FROM `comments` WHERE `post_id` = ?",
-      [post.id]
-    )
-      .then((commentCount) => {
-        // TODO: `commentCount`は配列かも
-        // @ts-ignore
-        post.comment_count = commentCount.count || 0;
-        var query =
-          "SELECT * FROM `comments` WHERE `post_id` = ? ORDER BY `created_at` DESC";
-        if (!options.allComments) {
-          query += " LIMIT 3";
-        }
-        return db
-          .query<Comment>(query, [post.id])
-          .then((comments) => {
-            return Promise.all(
-              comments.map((comment) => {
-                return makeComment(comment);
-              })
-            ).then((comments) => {
-              post.comments = comments;
-              return post;
-            });
-          })
-          .then((post) => {
-            return getUser(post.user_id).then((user) => {
-              post.user = user;
-              return post;
-            });
-          })
-          .then(resolve, reject);
-      })
-      .catch(reject);
-  });
+async function makePost(post: Post, options: { allComments?: boolean }) {
+  const commentCount = await db.query<{ count: number }>(
+    "SELECT COUNT(*) AS `count` FROM `comments` WHERE `post_id` = ?",
+    [post.id]
+  );
+  // TODO: `commentCount`は配列かも
+  // @ts-ignore
+  post.comment_count = commentCount.count || 0;
+  var query =
+    "SELECT * FROM `comments` WHERE `post_id` = ? ORDER BY `created_at` DESC";
+  if (!options.allComments) {
+    query += " LIMIT 3";
+  }
+  let comments = await db.query<Comment>(query, [post.id]);
+  comments = await Promise.all(
+    comments.map((comment) => {
+      return makeComment(comment);
+    })
+  );
+  post.comments = comments;
+  const user = await getUser(post.user_id);
+  post.user = user;
+  return post;
 }
 
 function filterPosts(posts: Post[]) {
@@ -274,125 +222,117 @@ function filterPosts(posts: Post[]) {
     .slice(0, POSTS_PER_PAGE);
 }
 
-function makePosts(posts: Post[], options?: { allComments?: boolean }) {
+async function makePosts(posts: Post[], options?: { allComments?: boolean }) {
   if (typeof options === "undefined") {
     options = {};
   }
   if (typeof options.allComments === "undefined") {
     options.allComments = false;
   }
-  return new Promise<Post[]>((resolve, reject) => {
-    if (posts.length === 0) {
-      resolve([]);
-      return;
-    }
-    Promise.all(
-      posts.map((post) => {
-        return makePost(post, options!);
-      })
-    ).then(resolve, reject);
-  });
+  if (posts.length === 0) {
+    return [];
+  }
+  return Promise.all(
+    posts.map((post) => {
+      return makePost(post, options!);
+    })
+  );
 }
 
-app.get("/initialize", (req, res) => {
-  dbInitialize()
-    .then(() => {
-      res.send("OK");
-    })
-    .catch((error) => {
-      console.log(error);
-      res.status(500).send(error);
-    });
+app.get("/initialize", async (req, res) => {
+  try {
+    await dbInitialize();
+    res.send("OK");
+  } catch (error) {
+    console.log(error);
+    res.status(500).send(error);
+  }
 });
 
-app.get("/login", (req, res) => {
-  getSessionUser(req).then((me) => {
-    if (me) {
-      res.redirect("/");
-      return;
-    }
-    res.render("login.ejs", { me });
-  });
+app.get("/login", async (req, res) => {
+  const me = await getSessionUser(req);
+  if (me) {
+    res.redirect("/");
+    return;
+  }
+  res.render("login.ejs", { me });
 });
 
-app.post("/login", (req, res) => {
-  getSessionUser(req).then((me) => {
-    if (me) {
-      res.redirect("/");
-      return;
-    }
-    tryLogin(req.body.account_name || "", req.body.password || "")
-      .then((user) => {
-        if (user) {
-          req.session.userId = user.id;
-          req.session.csrfToken = crypto.randomBytes(16).toString("hex");
-          res.redirect("/");
-        } else {
-          req.flash("notice", "アカウント名かパスワードが間違っています");
-          res.redirect("/login");
-        }
-      })
-      .catch((error) => {
-        console.log(error);
-        res.status(500).send(error);
-      });
-  });
-});
-
-app.get("/register", (req, res) => {
-  getSessionUser(req).then((me) => {
-    if (me) {
-      res.redirect("/");
-      return;
-    }
-    res.render("register.ejs", { me });
-  });
-});
-
-app.post("/register", (req, res) => {
-  getSessionUser(req).then((me) => {
-    if (me) {
-      res.redirect("/");
-      return;
-    }
-    let accountName = req.body.account_name || "";
-    let password = req.body.password || "";
-    let validated = validateUser(accountName, password);
-    if (!validated) {
-      req.flash(
-        "notice",
-        "アカウント名は3文字以上、パスワードは6文字以上である必要があります"
-      );
-      res.redirect("/register");
-      return;
-    }
-
-    db.query("SELECT 1 FROM users WHERE `account_name` = ?", accountName).then(
-      (rows) => {
-        if (rows[0]) {
-          req.flash("notice", "アカウント名がすでに使われています");
-          res.redirect("/register");
-          return;
-        }
-
-        calculatePasshash(accountName, password).then((passhash) => {
-          let query =
-            "INSERT INTO `users` (`account_name`, `passhash`) VALUES (?, ?)";
-          db.query(query, [accountName, passhash]).then(() => {
-            db.query<User>(
-              "SELECT * FROM `users` WHERE `account_name` = ?",
-              accountName
-            ).then((users) => {
-              let me = users[0];
-              req.session.userId = me.id;
-              req.session.csrfToken = crypto.randomBytes(16).toString("hex");
-              res.redirect("/");
-            });
-          });
-        });
-      }
+app.post("/login", async (req, res) => {
+  const me = await getSessionUser(req);
+  if (me) {
+    res.redirect("/");
+    return;
+  }
+  try {
+    const user = await tryLogin(
+      req.body.account_name || "",
+      req.body.password || ""
     );
-  });
+    if (user) {
+      req.session.userId = user.id;
+      req.session.csrfToken = crypto.randomBytes(16).toString("hex");
+      res.redirect("/");
+    } else {
+      req.flash("notice", "アカウント名かパスワードが間違っています");
+      res.redirect("/login");
+    }
+  } catch (error) {
+    console.log(error);
+    res.status(500).send(error);
+  }
+});
+
+app.get("/register", async (req, res) => {
+  const me = await getSessionUser(req);
+  if (me) {
+    res.redirect("/");
+    return;
+  }
+  res.render("register.ejs", { me });
+});
+
+app.post("/register", async (req, res) => {
+  const _me = await getSessionUser(req);
+  if (_me) {
+    res.redirect("/");
+    return;
+  }
+  let accountName = req.body.account_name || "";
+  let password = req.body.password || "";
+  let validated = validateUser(accountName, password);
+  if (!validated) {
+    req.flash(
+      "notice",
+      "アカウント名は3文字以上、パスワードは6文字以上である必要があります"
+    );
+    res.redirect("/register");
+    return;
+  }
+
+  const rows = await db.query(
+    "SELECT 1 FROM users WHERE `account_name` = ?",
+    accountName
+  );
+
+  if (rows[0]) {
+    req.flash("notice", "アカウント名がすでに使われています");
+    res.redirect("/register");
+    return;
+  }
+
+  const passhash = await calculatePasshash(accountName, password);
+  let query = "INSERT INTO `users` (`account_name`, `passhash`) VALUES (?, ?)";
+  await db.query(query, [accountName, passhash]);
+
+  const users = await db.query<User>(
+    "SELECT * FROM `users` WHERE `account_name` = ?",
+    accountName
+  );
+  let me = users[0];
+  req.session.userId = me.id;
+  req.session.csrfToken = crypto.randomBytes(16).toString("hex");
+  res.redirect("/");
 });
 
 app.get("/logout", (req, res) => {
@@ -401,143 +341,101 @@ app.get("/logout", (req, res) => {
   res.redirect("/");
 });
 
-app.get("/", (req, res) => {
-  getSessionUser(req)
-    .then((me) => {
-      db.query<Post>(
-        "SELECT `id`, `user_id`, `body`, `created_at`, `mime` FROM `posts` ORDER BY `created_at` DESC"
+app.get("/", async (req, res) => {
+  const me = await getSessionUser(req);
+  try {
+    let posts = await db.query<Post>(
+      "SELECT `id`, `user_id`, `body`, `created_at`, `mime` FROM `posts` ORDER BY `created_at` DESC"
+    );
+    posts = await makePosts(posts.slice(0, POSTS_PER_PAGE * 2));
+    res.render("index.ejs", {
+      posts: filterPosts(posts),
+      me: me,
+      imageUrl: imageUrl,
+    });
+  } catch (error) {
+    console.log(error);
+    res.status(500).send(error);
+  }
+});
+
+app.get("/@:accountName/", async (req, res) => {
+  try {
+    const users = await db.query<User>(
+      "SELECT * FROM `users` WHERE `account_name` = ? AND `del_flg` = 0",
+      req.params.accountName
+    );
+
+    let user = users[0];
+    if (!user) {
+      res.status(404).send("not_found");
+      return Promise.reject();
+    }
+
+    let posts = await db.query<Post>(
+      "SELECT `id`, `user_id`, `body`, `mime`, `created_at` FROM `posts` WHERE `user_id` = ? ORDER BY `created_at` DESC",
+      user.id
+    );
+    posts = await makePosts(posts);
+
+    const commentCount = await db
+      .query<{ count: number }>(
+        "SELECT COUNT(*) AS count FROM `comments` WHERE `user_id` = ?",
+        user.id
       )
-        .then((posts) => {
-          return makePosts(posts.slice(0, POSTS_PER_PAGE * 2));
-        })
-        .then((posts) => {
-          res.render("index.ejs", {
-            posts: filterPosts(posts),
-            me: me,
-            imageUrl: imageUrl,
-          });
-        });
-    })
-    .catch((error) => {
-      console.log(error);
-      res.status(500).send(error);
-    });
-});
+      .then((commentCount) => (commentCount[0] ? commentCount[0].count : 0));
 
-interface Context {
-  user: User;
-  posts: Post[];
-  commentCount?: number;
-  postCount?: number;
-  commentedCount?: number;
-  me?: User;
-}
+    const postIds = await db
+      .query<Post>("SELECT `id` FROM `posts` WHERE `user_id` = ?", user.id)
+      .then((postIdRows) => {
+        return postIdRows.map((row) => row.id);
+      });
 
-app.get("/@:accountName/", (req, res) => {
-  db.query<User>(
-    "SELECT * FROM `users` WHERE `account_name` = ? AND `del_flg` = 0",
-    req.params.accountName
-  )
-    .then((users) => {
-      let user = users[0];
-      if (!user) {
-        res.status(404).send("not_found");
-        return Promise.reject();
-      }
-      return user;
-    })
-    .then((user) => {
-      return db
-        .query<Post>(
-          "SELECT `id`, `user_id`, `body`, `mime`, `created_at` FROM `posts` WHERE `user_id` = ? ORDER BY `created_at` DESC",
-          user.id
-        )
-        .then((posts) => makePosts(posts))
-        .then((posts) => {
-          return { user, posts };
-        });
-    })
-    .then((context: Context) => {
-      return db
+    const postCount = postIds.length;
+
+    let commentedCount = 0;
+    if (postCount !== 0)
+      commentedCount = await db
         .query<{ count: number }>(
-          "SELECT COUNT(*) AS count FROM `comments` WHERE `user_id` = ?",
-          context.user.id
+          "SELECT COUNT(*) AS count FROM `comments` WHERE `post_id` IN (?)",
+          [postIds]
         )
-        .then((commentCount) => {
-          context.commentCount = commentCount[0] ? commentCount[0].count : 0;
-          return context;
+        .then((commentedCount) => {
+          return commentedCount[0] ? commentedCount[0].count : 0;
         });
-    })
-    .then((context: Context) => {
-      return db
-        .query<Post>(
-          "SELECT `id` FROM `posts` WHERE `user_id` = ?",
-          context.user.id
-        )
-        .then((postIdRows) => {
-          return postIdRows.map((row) => row.id);
-        })
-        .then((postIds) => {
-          context.postCount = postIds.length;
-          if (context.postCount === 0) {
-            context.commentedCount = 0;
-            return context;
-          } else {
-            return db
-              .query<{ count: number }>(
-                "SELECT COUNT(*) AS count FROM `comments` WHERE `post_id` IN (?)",
-                [postIds]
-              )
-              .then((commentedCount) => {
-                context.commentedCount = commentedCount[0]
-                  ? commentedCount[0].count
-                  : 0;
-                return context;
-              });
-          }
-        });
-    })
-    .then((context: Context) => {
-      return getSessionUser(req).then((me) => {
-        context.me = me;
-        return context;
-      });
-    })
-    .then((context) => {
-      res.render("user.ejs", {
-        me: context.me,
-        user: context.user,
-        posts: filterPosts(context.posts),
-        post_count: context.postCount,
-        comment_count: context.commentCount,
-        commented_count: context.commentedCount,
-        imageUrl: imageUrl,
-      });
-    })
-    .catch((error) => {
-      if (error) {
-        res.status(500).send("ERROR");
-        throw error;
-      }
+
+    const me = await getSessionUser(req);
+
+    res.render("user.ejs", {
+      me,
+      user,
+      posts: filterPosts(posts),
+      post_count: postCount,
+      comment_count: commentCount,
+      commented_count: commentedCount,
+      imageUrl: imageUrl,
     });
+  } catch (error) {
+    if (error) {
+      res.status(500).send("ERROR");
+      throw error;
+    }
+  }
 });
 
-app.get("/posts", (req, res) => {
+app.get("/posts", async (req, res) => {
   // @ts-ignore
   let max_created_at = new Date(req.query.max_created_at);
   if (max_created_at.toString() === "Invalid Date") {
     max_created_at = new Date();
   }
-  db.query<Post>(
+  let posts = await db.query<Post>(
     "SELECT `id`, `user_id`, `body`, `mime`, `created_at` FROM `posts` WHERE `created_at` <= ? ORDER BY `created_at` DESC",
     max_created_at
-  ).then((posts) => {
-    makePosts(posts.slice(0, POSTS_PER_PAGE * 2)).then((posts) => {
-      getSessionUser(req).then((me) => {
-        res.render("posts.ejs", { me, imageUrl, posts: filterPosts(posts) });
-      });
-    });
-  });
+  );
+  posts = await makePosts(posts.slice(0, POSTS_PER_PAGE * 2));
+  const me = await getSessionUser(req);
+  res.render("posts.ejs", { me, imageUrl, posts: filterPosts(posts) });
 });
 
 app.get("/posts/:id", (req, res) => {
